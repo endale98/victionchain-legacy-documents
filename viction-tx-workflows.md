@@ -1,320 +1,362 @@
 # Viction Transaction Workflows
 
-This document traces the complete execution path for every transaction type in `vic-geth`,
-from block entry through state finalization. Covers hook dispatch, gas accounting, fee routing,
-and the VRC25 sponsorship mechanism.
+Covers the full per-transaction gas and fee lifecycle for both **vic-geth** (current)
+and **victionchain** (legacy reference). Use this when reasoning about sponsorship
+correctness, fee routing, or porting logic between the two clients.
 
 ---
 
-## Block Processing Loop
+## Hardfork Reference
 
-`core/state_processor.go: Process()`
-
-```
-for each tx in block:
-    1. msg, err = tx.AsMessage(signer)
-    2. beforeApplyTransaction(block, tx, msg, statedb)       ← viction hook
-    3. statedb.Prepare(tx.Hash, block.Hash, i)
-    4. handled, receipt, _, err, _ = applyVictionTransaction(...)  ← viction hook
-    5. if !handled:
-           receipt, err = applyTransaction(msg, ...)          ← standard EVM path
-    6. afterApplyTransaction(tx, msg, statedb, receipt, ...)  ← viction hook
-
-p.engine.Finalize(...)
-afterProcess(block, statedb)                                  ← viction hook
-```
-
----
-
-## Hook Reference
-
-All hooks live in `core/state_processor_viction.go`.
-
-| Hook | When | Purpose |
+| Hardfork | Block | Effect |
 |---|---|---|
-| `beforeProcess` | Start of block | Initialize `victionState`, apply hardfork state mutations, open TradingStateDB |
-| `beforeApplyTransaction` | Before each tx | Blacklist check, legacy balance bypass |
-| `applyVictionTransaction` | Before EVM | Route system transactions (0x89 / 0x91–0x94) |
-| `afterApplyTransaction` | After each tx | VRC25 failed-tx fee charge |
-| `afterProcess` | End of block | TomoX trading root verification |
+| TIPSigning | 3,000,000 | BlockSigner contract deleted from state |
+| BlackListHF | 9,349,100 | Blacklist validation enabled |
+| TIPTRC21Fee | 13,523,400 | Fee routed to validator owner instead of coinbase |
+| TIPTomoX | 20,581,700 | TomoX order transactions enabled |
+| Atlas | 97,705,094 | VRC25GasPrice introduced; VRC25 storage layout upgraded |
 
 ---
 
-## Transaction Types
+## vic-geth
 
-### 1. Normal EVM Transaction
+### Block-level hooks (`state_processor_viction.go`)
 
-A regular user transaction calling a non-system contract (or ETH transfer).
+```
+beforeProcess(block)
+  - Delete BlockSigner contract at TIPSigning block
+  - Apply VRC25 storage upgrade at Atlas block
+  - Apply Saigon hardfork state changes
+  - Pre-cache tx signers in parallel
 
-**`applyVictionTransaction` returns:** `handled = false`
+for each tx:
+  beforeApplyTransaction(tx)     ← blacklist check, bypass balances for legacy blocks
+  applyVictionTransaction(tx)    ← handle system txs (BlockSigner 0x89); returns (handled, receipt)
+  if not handled:
+    ApplyTransaction(tx)         ← standard EVM path (see per-tx flow below)
+  afterApplyTransaction(tx)      ← failed-tx VRC25 token penalty (pre-Atlas only)
 
-**Full path: `applyTransaction` → `TransitionDb()`**
+afterProcess(block)              ← currently no-op
+```
+
+### Per-transaction flow (`state_transition.go` + `state_transition_viction.go`)
 
 ```
 preCheck()
-  └─ vrc25BuyGas()
-       st.payer = msg.From()          // default: sender pays
-       feeCap = GetFeeCapacity(...)   // check if contract is VRC25-sponsored
-       if feeCap < vrc25GasFee:       // insufficient or not sponsored
-           return nil                 // payer stays as sender, gasPrice unchanged
   └─ buyGas()
-       mgval = gasLimit × msg.GasPrice()
-       SubBalance(sender, mgval)      // sender pays upfront
-       st.gas = gasLimit
+       └─ vrc25BuyGas()      ← sets st.payer and st.gasPrice if sponsored
 
-IntrinsicGas check
-
-EVM execution (Call or Create)
-  → st.gas decremented by opcodes
+EVM executes (Call / Create)
 
 refundGas()
-  refund = min(gasUsed/2, stateRefund)
-  st.gas += refund
-  remaining = st.gas × gasPrice
-  isCustomGasRefunding = false (pre-Atlas non-sponsored)
-  → AddBalance(sender, remaining)    // refund unused gas to sender
-  gp.AddGas(st.gas)                  // return to block gas counter
+  isCustomGasRefunding = isVRC25Transaction() || IsAtlas
+  ├─ true  → vrc25RefundGas(remaining)
+  └─ false → AddBalance(msg.From, remaining)
 
 applyTransactionFee()
-  txFee = gasUsed() × gasPrice
-  if IsTIPTRC21Fee: AddBalance(validatorOwner, txFee)
-  else:             AddBalance(coinbase, txFee)
 ```
 
-**Net ETH balance changes:**
-- Sender: `-gasUsed × gasPrice`
-- Coinbase / validator owner: `+gasUsed × gasPrice`
+### `vrc25BuyGas()` logic
+
+```
+st.payer = msg.From   (default)
+
+feeCap = storage[VRC25Contract][tokensState[msg.To]]
+
+if feeCap == nil:          → contract creation, no sponsorship — return
+if feeCap < gasLimit×P:    → insufficient capacity, fallback to sender — return
+
+storage[tokensState[msg.To]] -= gasLimit × P
+st.gasPrice = P                   ← P = VRC25GasPrice
+st.payer    = VRC25Contract
+```
+
+After `vrc25BuyGas`, `buyGas()` always does:
+```
+SubBalance(st.payer, gasLimit × st.gasPrice)
+```
+So for sponsored txs: `SubBalance(VRC25Contract, gasLimit × P)`.
+
+### `vrc25RefundGas(remaining)` logic
+
+```
+if isVRC25Transaction():
+  storage[tokensState[msg.To]] += remaining   ← restore unused capacity
+
+AddBalance(st.payer, remaining)               ← return native ETH to whoever paid
+```
+
+`isVRC25Transaction()` = `st.payer != msg.From`.
+For Atlas non-sponsored txs the storage write is skipped; only the ETH refund runs.
+
+### `applyTransactionFee()` logic
+
+```
+txFee = gasUsed × st.gasPrice
+
+if victionCfg == nil:
+  AddBalance(coinbase, txFee)   ← non-Viction chain
+  return
+
+if IsAtlas && isVRC25Transaction() && VRC25GasPrice != nil:
+  txFee = gasUsed × VRC25GasPrice   ← defensive recalculate (already correct)
+
+if not IsTIPTRC21Fee:
+  AddBalance(coinbase, txFee)
+  return
+
+owner = state[ValidatorContract][slot(coinbase)]
+if owner != zero:
+  AddBalance(owner, txFee)
+```
+
+### `afterApplyTransaction()` logic
+
+```
+if not IsAtlas && tx.To != nil && IsTIPTRC21Fee && receipt.Status == Failed:
+  feeCap = storage[VRC25Contract][tokensState[tx.To]]
+  if feeCap > 0:
+    PayFeeWithVRC25(msg.From, tx.To)
+    → deducts minFee from user's token balance, credits token issuer
+```
+
+Only fires pre-Atlas. Post-Atlas this path is disabled.
 
 ---
 
-### 2. VRC25-Sponsored Transaction (pre-Atlas)
+### Scenario Flows
 
-A transaction to a VRC25 token contract where the contract has enough pre-deposited
-fee capacity to cover the gas cost. Gas is "free" for the sender in ETH terms; the
-VRC25 contract absorbs the gas cost in native ETH from its pre-deposit.
-
-**`applyVictionTransaction` returns:** `handled = false` (normal EVM path)
+#### 1. Pre-Atlas, non-sponsored
 
 ```
-preCheck()
-  └─ vrc25BuyGas()
-       st.payer = msg.From()            // set default first
-       feeCap = GetFeeCapacity(statedb, VRC25Contract, tx.To())
-       vrc25GasFee = gasLimit × VRC25GasPrice
-       if feeCap >= vrc25GasFee:        // contract can cover gas
-           storage[tx.To()] -= vrc25GasFee   // deduct from fee capacity slot
-           st.gasPrice = VRC25GasPrice
-           st.payer   = VRC25Contract
-  └─ buyGas()
-       mgval = gasLimit × VRC25GasPrice
-       SubBalance(VRC25Contract, mgval)  // sponsor pays upfront
-       st.gas = gasLimit
-
-IntrinsicGas check
-
-EVM execution
-  → on SUCCESS: token transfer executes, user pays token fee to issuer via EVM
-  → on FAILURE: EVM reverts, no token transfer, no token fee paid
-
-refundGas()
-  refund = min(gasUsed/2, stateRefund)
-  st.gas += refund
-  remaining = st.gas × VRC25GasPrice
-  isCustomGasRefunding = true (isVRC25Transaction())
-  → vrc25RefundGas(remaining):
-       storage[tx.To()] += remaining          // restore unused capacity to slot
-       AddBalance(VRC25Contract, remaining)   // restore unused native ETH
-  gp.AddGas(st.gas)
-
-applyTransactionFee()
-  txFee = gasUsed() × VRC25GasPrice
-  → AddBalance(validatorOwner or coinbase, txFee)
-
-afterApplyTransaction()  [state_processor_viction.go]
-  if !IsAtlas && IsTIPTRC21Fee && receipt.Status == FAILED:
-      feeCap = GetFeeCapacity(statedb, VRC25Contract, tx.To())
-      if feeCap > 0:
-          PayFeeWithVRC25(statedb, sender, tx.To())
-          // charges min(senderTokenBalance, minFee) tokens
-          // deducts from sender's token balance, credits issuer
-          // reason: tx failed so EVM never executed the token fee
+vrc25BuyGas:  feeCap == 0 → payer = msg.From, gasPrice = tx.gasPrice
+buyGas:       SubBalance(msg.From, gasLimit × gasPrice)
+EVM:          executes
+refundGas:    isCustomGasRefunding = false
+              AddBalance(msg.From, remaining)
+applyFee:     IsTIPTRC21Fee? AddBalance(validatorOwner, gasUsed × gasPrice)
+                          : AddBalance(coinbase, gasUsed × gasPrice)
+afterApply:   nothing
 ```
 
-**Net ETH balance changes:**
-- Sender: `0` (no ETH spent)
-- VRC25Contract: `-actualGasUsed × VRC25GasPrice`
-- Coinbase / validator owner: `+actualGasUsed × VRC25GasPrice`
+#### 2. Pre-Atlas, VRC25-sponsored, success
 
-**Net VRC25 storage change:**
-- `feeCap[tx.To()]`: `-actualGasUsed × VRC25GasPrice`
+```
+vrc25BuyGas:  storage[tokensState[contract]] -= gasLimit × P
+              payer = VRC25Contract, gasPrice = P
+buyGas:       SubBalance(VRC25Contract, gasLimit × P)
+EVM:          executes (success)
+refundGas:    isCustomGasRefunding = true
+              storage[tokensState[contract]] += remaining
+              AddBalance(VRC25Contract, remaining)
+applyFee:     AddBalance(validatorOwner, gasUsed × P)
+afterApply:   receipt.Status == Success → nothing
 
-**Token balance change (success):** user pays fee via EVM execution of the transfer
-**Token balance change (failure):** `PayFeeWithVRC25` deducts `min(balance, minFee)` from sender
+Net: VRC25Contract −(gasUsed × P) in both storage and native ETH.
+```
+
+#### 3. Pre-Atlas, VRC25-sponsored, failed tx
+
+```
+vrc25BuyGas:  same deductions as success case
+buyGas:       SubBalance(VRC25Contract, gasLimit × P)
+EVM:          reverts (token transfer never executes)
+refundGas:    storage += remaining, AddBalance(VRC25Contract, remaining)
+applyFee:     AddBalance(validatorOwner, gasUsed × P)
+afterApply:   receipt.Status == Failed, IsTIPTRC21Fee, feeCap > 0
+              PayFeeWithVRC25(msg.From, contract)
+              → user's token balance −minFee, issuer's token balance +minFee
+
+Net: VRC25Contract pays gas in ETH. User pays a token penalty.
+```
+
+#### 4. Post-Atlas, non-sponsored
+
+```
+vrc25BuyGas:  feeCap == 0 → payer = msg.From, gasPrice = tx.gasPrice
+buyGas:       SubBalance(msg.From, gasLimit × gasPrice)
+EVM:          executes
+refundGas:    isCustomGasRefunding = true (IsAtlas)
+              isVRC25Transaction == false → skip storage
+              AddBalance(msg.From, remaining)       ← identical to non-Atlas path
+applyFee:     AddBalance(validatorOwner, gasUsed × gasPrice)
+afterApply:   IsAtlas → condition false → nothing
+```
+
+#### 5. Post-Atlas, VRC25-sponsored
+
+```
+vrc25BuyGas:  storage[tokensState[contract]] -= gasLimit × P
+              payer = VRC25Contract, gasPrice = P
+buyGas:       SubBalance(VRC25Contract, gasLimit × P)
+EVM:          executes
+refundGas:    isCustomGasRefunding = true
+              isVRC25Transaction == true → storage += remaining
+              AddBalance(VRC25Contract, remaining)
+applyFee:     txFee recalculated with VRC25GasPrice (defensive; already correct)
+              AddBalance(validatorOwner, gasUsed × P)
+afterApply:   IsAtlas → condition false → nothing (no token penalty post-Atlas)
+```
+
+### ETH accounting summary
+
+| Scenario | Who pays | Net ETH cost | Token cost |
+|---|---|---|---|
+| Non-sponsored | msg.From | gasUsed × tx.gasPrice | none |
+| Sponsored, success | VRC25Contract | gasUsed × VRC25GasPrice | none |
+| Sponsored, failed (pre-Atlas) | VRC25Contract | gasUsed × VRC25GasPrice | user pays minFee in token |
+| Sponsored, failed (post-Atlas) | VRC25Contract | gasUsed × VRC25GasPrice | none |
 
 ---
 
-### 3. VRC25-Sponsored Transaction (post-Atlas)
+## victionchain (legacy)
 
-Identical to the pre-Atlas path through `TransitionDb()`. The differences are:
+### Block-level (`state_processor.go`)
 
-- `ApplyVIPVRC25Upgrade` runs in `beforeProcess` at the Atlas block, migrating VRC25
-  contract state.
-- `applyTransactionFee()` uses `VRC25GasPrice` for VRC25 txs (explicit recalculation
-  at line 93 of `state_transition_viction.go`).
-- `afterApplyTransaction` fee tracking is gated by `!IsAtlas` — no block-level fee
-  accumulation at Atlas+, since storage and ETH are handled per-tx.
+```
+balanceFee = pre-loaded map[tokenAddr → feeCapacity] from state   ← pre-Atlas only
+             (post-Atlas: read fresh from state per-tx instead)
+
+parentState = statedb.Copy()   ← snapshot for potential revert
+
+for each tx:
+  blacklist check
+  TomoZ/TomoX apply-tx validation
+  ApplyTransaction(config, balanceFee, ...)
+  if tokenFeeUsed && !isAtlas:
+    balanceFee[tx.To] -= gasUsed × TRC21GasPrice   ← update in-memory map
+    balanceUpdated[tx.To] = balanceFee[tx.To]
+    totalFeeUsed += gasUsed × TRC21GasPrice
+
+if !isAtlas:
+  UpdateTRC21Fee(statedb, balanceUpdated, totalFeeUsed)
+  → batch-writes balanceUpdated to storage slots
+  → SubBalance(TRC21IssuerSMC, totalFeeUsed)
+```
+
+The `balanceFee` map is the block-scope accounting mechanism for pre-Atlas sponsored fees.
+Post-Atlas, fee capacity is written directly per-tx (no batch at end of block).
+
+### Per-transaction flow
+
+```
+preCheck(useAtlasRule)
+  └─ buyGas(useAtlasRule)
+       ├─ checkBalance(balanceTokenFee, useAtlasRule)
+       └─ subtractBalance(balanceTokenFee, useAtlasRule) → isUsedTokenFee bool
+
+EVM executes
+
+refundGas(isUsedTokenFee)
+
+transactionFee = gasUsed × gasPrice
+if isAtlas && isUsedTokenFee:
+  transactionFee = gasUsed × TRC21GasPrice
+
+if block > TIPTRC21FeeBlock:
+  AddBalance(coinbaseOwner, transactionFee)
+else:
+  AddBalance(coinbase, transactionFee)
+```
+
+### `buyGas` / `subtractBalance` logic
+
+**Pre-Atlas:**
+```
+balanceTokenFee = balanceFee[tx.To]   ← from pre-loaded map
+
+if balanceTokenFee == nil:
+  SubBalance(sender, gasLimit × gasPrice)   ← regular tx
+  isUsedTokenFee = false
+else if balanceTokenFee < gasLimit × gasPrice:
+  error: insufficient balance            ← pre-Atlas requires full VIC equivalent
+else:
+  // sponsored — do NOT SubBalance anyone
+  isUsedTokenFee = true
+```
+
+Pre-Atlas sponsored txs: **no ETH is deducted at buyGas time**. The fee capacity is
+tracked only in the in-memory `balanceFee` map, flushed to state at end of block.
+
+**Post-Atlas:**
+```
+balanceTokenFee = GetTRC21FeeCapacityFromStateWithToken(statedb, tx.To)   ← live from state
+
+vrc25val = gasLimit × TRC21GasPrice
+
+if balanceTokenFee == nil || balanceTokenFee <= vrc25val:
+  SubBalance(sender, gasLimit × gasPrice)
+  isUsedTokenFee = false
+else:
+  vrc25PayGas(token, vrc25val):
+    storage[tokensState[token]] -= vrc25val
+    SubBalance(TRC21IssuerSMC, vrc25val)
+  isUsedTokenFee = true
+```
+
+Post-Atlas sponsored txs: ETH deducted from `TRC21IssuerSMC` immediately at buyGas.
+
+### `refundGas(isUsedTokenFee)` logic
+
+**Pre-Atlas:**
+```
+if balanceTokenFee == nil:
+  AddBalance(sender, remaining)     ← regular tx refund
+// sponsored: no refund (no ETH was charged)
+```
+
+**Post-Atlas:**
+```
+if isUsedTokenFee:
+  vrc25RefundGas(token, remaining):
+    storage[tokensState[token]] += remaining
+    AddBalance(TRC21IssuerSMC, remaining)
+// non-sponsored post-Atlas: no refund
+```
+
+> Note: post-Atlas non-sponsored txs in victionchain receive no gas refund.
+> The sender pays for the full `gasLimit × gasPrice` regardless of actual usage.
+
+### Failed-tx token penalty
+
+In `ApplyTransaction`, after EVM execution:
+```
+fee = gasUsed × gasPrice
+if block > TIPTRC21FeeBlock:
+  fee = gasUsed × TRC21GasPrice
+
+if balanceFee != nil && balanceFee > fee && failed:
+  PayFeeWithTRC21TxFail(statedb, msg.From, tx.To)
+  → deducts minFee from user's token balance
+```
+
+This fires for both pre-Atlas and post-Atlas sponsored failed txs.
 
 ---
 
-### 4. Non-Sponsored Atlas Transaction
+## Side-by-Side Comparison
 
-A regular transaction at an Atlas-height block where `IsAtlas == true` but the
-transaction is NOT VRC25-sponsored (either not a VRC25 contract, or fee capacity
-was insufficient).
-
-The only Atlas-specific difference is in `refundGas()`:
-
-```
-isCustomGasRefunding = false || IsAtlas = true
-→ vrc25RefundGas(remaining):
-     isVRC25Transaction() == false → skip storage update
-     AddBalance(sender, remaining)  // normal ETH refund
-```
-
-**Net:** identical to a normal EVM transaction (Section 1).
-
----
-
-### 5. BlockSigner Transaction (0x89 — `applySignTransaction`)
-
-Validator signature recording. Active only after `TIPSigningBlock`. Deleted from state
-at `TIPSigningBlock` via `beforeProcess`.
-
-**`applyVictionTransaction` returns:** `handled = true, receipt (GasUsed=0)`
-
-```
-applySignTransaction():
-    Finalise or IntermediateRoot (Byzantium check)
-    Verify sender from signer
-    Nonce check (ErrNonceTooHigh / ErrNonceTooLow)
-    statedb.SetNonce(sender, nonce+1)
-    Build receipt: GasUsed=0, Status=success
-    Emit log at ValidatorBlockSignContract
-```
-
-**No gas deducted. No ETH movement. Nonce incremented.**
-
----
-
-### 6. TomoX Order Match (0x91 — `applyTomoXTx`)
-
-Batch of order executions. Active pre-Atlas only, after `TIPTomoX`.
-
-**`applyVictionTransaction` returns:** `handled = true, receipt (GasUsed=0)`
-
-```
-applyTomoXTx():
-    Finalise or IntermediateRoot (Byzantium check)
-    if tx.Data != nil && tradingStateDB != nil && tradingEngine != nil:
-        txMatchBatch = DecodeTxMatchesBatch(tx.Data)  // HARD error on failure
-        for each match in batch:
-            order = txDataMatch.DecodeOrder()          // soft skip on failure (log.Warn)
-            orderBook = GetTradingOrderBookHash(base, quote)
-            trades, rejects, err = CommitOrder(header, coinbase, bc,
-                                               statedb, tradingStateDB,
-                                               orderBook, order)        // HARD error
-    Build receipt: GasUsed=0
-    Emit log at TomoXContract
-```
-
-**No gas deducted. Mutates both EVM statedb (token balances) and TradingStateDB (order books).**
-
----
-
-### 7. Trading State Root Commit (0x92 — `applyEmptyTransaction`)
-
-Encodes the TradingStateDB Merkle root into the block. Active pre-Atlas only,
-after `TIPTomoX`. Verified at block end by `afterProcess` via `GetTradingStateRoot`.
-
-**`applyVictionTransaction` returns:** `handled = true, receipt (GasUsed=0)`
-
-```
-applyEmptyTransaction():
-    Finalise or IntermediateRoot (Byzantium check)
-    Build receipt: GasUsed=0
-    Emit log at TradingStateContract
-```
-
-**No state mutation. Acts as a data carrier for the trading root.**
-
-`GetTradingStateRoot()` recovery logic (called from `afterProcess`):
-
-```
-for each tx in block:
-    if tx.To() == TradingStateContract:
-        from = Sender(HomesteadSigner, tx)  // 0x92 always uses HomesteadSigner
-        if from == blockAuthor:
-            return tx.Data()[:32]           // first 32 bytes = trading root
-return EmptyRoot
-```
-
----
-
-### 8. Lending Batch / Finalized (0x93 / 0x94 — `applyEmptyTransaction`)
-
-Same as 0x92 but for the lending engine. Active pre-Atlas only, after `TIPTomoXLending`.
-No state mutation. Data carrier only.
-
----
-
-## VRC25 Fee Capacity Accounting (Summary)
-
-```
-Per-transaction (state_transition_viction.go):
-  vrc25BuyGas():
-    storage[tx.To() in VRC25Contract] -= gasLimit × VRC25GasPrice
-    payer = VRC25Contract
-    gasPrice = VRC25GasPrice
-  buyGas() in state_transition.go:
-    SubBalance(VRC25Contract, gasLimit × VRC25GasPrice)
-  vrc25RefundGas():
-    storage[tx.To() in VRC25Contract] += unused × VRC25GasPrice   ← iff sponsored
-    AddBalance(payer, unused × VRC25GasPrice)
-
-Net after transaction:
-  storage[token]: -actualGasUsed × VRC25GasPrice
-  VRC25Contract ETH: -actualGasUsed × VRC25GasPrice
-  validator/coinbase ETH: +actualGasUsed × VRC25GasPrice
-
-No block-end batch update (UpdateFeeCapacity) is needed or called.
-The per-tx mechanism is self-contained.
-```
-
----
-
-## afterProcess — TomoX Root Verification
-
-Runs after all transactions for pre-Atlas blocks with an active trading engine.
-
-```
-afterProcess():
-    gotRoot  = tradingStateDB.IntermediateRoot()
-    author   = engine.Author(block.Header)
-    expected = GetTradingStateRoot(block, TradingStateContract, author)
-    if gotRoot != expected:
-        return HARD ERROR  // consensus-critical: block is rejected
-    log.Debug("trading state root verified")
-```
-
----
-
-## Error Handling Conventions
-
-| Location | Error type | Reason |
+| | vic-geth | victionchain |
 |---|---|---|
-| `beforeProcess` — `GetTradingState` fails | Hard error | nil tradingStateDB skips root check → invalid blocks accepted |
-| `applyTomoXTx` — batch decode fails | Hard error | Cannot replay trading state deterministically |
-| `applyTomoXTx` — per-order decode fails | Soft skip (`log.Warn`) | Matches victionchain; individual bad orders don't abort the block |
-| `applyTomoXTx` — `CommitOrder` fails | Hard error | Matches victionchain; order engine failure means state is corrupt |
-| `afterProcess` — root mismatch | Hard error | Consensus-critical: mismatched roots invalidate the block |
-| `applySignTransaction` — sender error | Returns error in receipt | Treated as invalid tx, block is rejected |
+| **Sponsorship detection** | `GetFeeCapacity` from storage per-tx | pre-Atlas: pre-loaded `balanceFee` map; post-Atlas: `GetTRC21FeeCapacityFromStateWithToken` per-tx |
+| **Pre-Atlas buy gas (sponsored)** | deducts storage + `SubBalance(VRC25Contract)` | no ETH deducted; in-memory map only |
+| **Pre-Atlas refund (sponsored)** | restores storage + `AddBalance(VRC25Contract)` | no refund (no ETH was charged) |
+| **Pre-Atlas fee flush** | none needed (per-tx accounting) | `UpdateTRC21Fee` batch-writes all updates at end of block |
+| **Post-Atlas buy gas (sponsored)** | deducts storage + `SubBalance(VRC25Contract)` | deducts storage + `SubBalance(TRC21IssuerSMC)` |
+| **Post-Atlas refund (sponsored)** | restores storage + `AddBalance(VRC25Contract)` | restores storage + `AddBalance(TRC21IssuerSMC)` |
+| **Post-Atlas refund (non-sponsored)** | `AddBalance(msg.From, remaining)` — standard | no refund |
+| **Failed-tx token penalty** | pre-Atlas only (`afterApplyTransaction`) | both pre- and post-Atlas (`ApplyTransaction`) |
+| **Fee recipient** | `ValidatorContract` owner after TIPTRC21Fee; coinbase before | `coinbaseOwner` (from `statedb.GetOwner`) after TIPTRC21Fee; coinbase before |
+| **Gas price override** | `st.gasPrice = VRC25GasPrice` in `vrc25BuyGas` | `transactionFee` recalculated after EVM; gasPrice not overridden |
+| **System contract address** | `VRC25Contract` (from `VictionConfig`) | `TRC21IssuerSMC` (hardcoded `common` constant) |
+| **Atlas non-sponsored refund path** | `vrc25RefundGas` (storage write skipped) | no refund |
+
+### Key architectural difference
+
+victionchain uses a **block-scope batch model** pre-Atlas: sponsored fees accumulate in
+an in-memory map and are flushed in one `UpdateTRC21Fee` call at the end of the block.
+This means mid-block queries to storage see stale fee capacities.
+
+vic-geth uses a **per-transaction model** for all forks: each sponsored tx updates the
+storage slot and native ETH balance atomically within its own `vrc25BuyGas` /
+`vrc25RefundGas` calls. Mid-block fee capacity is always accurate.
